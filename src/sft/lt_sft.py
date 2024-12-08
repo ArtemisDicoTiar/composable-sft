@@ -1,5 +1,6 @@
 import logging
 import os
+import gc
 
 import numpy as np
 import torch
@@ -8,6 +9,14 @@ from tqdm import tqdm
 from .trainer import SparseFineTuner
 
 logger = logging.getLogger(__name__)
+
+
+import psutil
+def mem_usage():
+    p = psutil.Process()
+    #byte를 사람이 인지하기 쉬운 megabyte로 변환
+    #megabyte이므로 1024 * 1024의 값을 나눠줌
+    print(f'mem usage : {p.memory_info().rss/2**20}MB')
 
 
 def LotteryTicketSparseFineTuner(_Trainer):
@@ -27,31 +36,77 @@ def LotteryTicketSparseFineTuner(_Trainer):
                 self.n_tunable_params = self.sft_args.ft_params_num
 
         def unfreeze_k_most_changed_params(self, k):
+            print(f"{k} params will be unfrozen")
+
             with torch.no_grad():
                 diffs = []
                 for n, p in tqdm(
-                    list(self.model.named_parameters()),
-                    desc='Finding masking threshold',
-                    disable=self.args.local_rank > 0 or self.args.disable_tqdm,
+                        list(self.model.named_parameters()),
+                        desc='Finding masking threshold',
+                        disable=self.args.local_rank > 0 or self.args.disable_tqdm,
                 ):
-                    p.grad = None # save some memory to use for the diff calculation
+                    p.grad = None  # save some memory to use for the diff calculation
                     if n in self.maskable_params:
                         delta = p - self._original_params[n].to(p.device)
                         delta = delta.view(-1)
+                        self._mask[n] = self._mask[n].to(p.device)
                         valid_indices = (~self._mask[n]).view(-1)
                         valid_deltas = delta[valid_indices]
                         abs_deltas = torch.abs(valid_deltas)
-                        diffs.extend(abs_deltas.tolist())
+                        diffs.append(abs_deltas)
                 
-                if k > len(diffs):
-                    raise ValueError(
-                        'Was requested to unfreeze {k} params, but only '
-                        '{len(diffs)} are frozen.'
-                    )
-                diffs = np.partition(diffs, len(diffs) - k)
-                thresh = diffs[len(diffs) - k]
-                logger.info(f'Masking threshold = {thresh}')
-                
+                print("reducing diffs: ", end="")
+                while sum([len(diff) for diff in diffs]) > k:
+                    print(".", end="")
+                    new_diffs = []
+                    tmp_diffs = []
+                    for diff in diffs:
+                        if sum([d.shape[0] for d in tmp_diffs]) > k:
+                            lowest_rank = min([
+                                diff.device.index for diff in tmp_diffs
+                            ])
+                            tmp_diffs = [
+                                diff.to(lowest_rank) for diff in tmp_diffs
+                            ]
+
+                            tmp_diffs_topk = torch.topk(
+                                torch.cat(tmp_diffs),
+                                k,
+                                largest=True,
+                            )
+                            new_diffs.append(tmp_diffs_topk.values)
+                            tmp_diffs = []
+
+                        tmp_diffs.append(diff)
+
+                    if len(tmp_diffs) > 0:
+                        if sum([d.shape[0] for d in tmp_diffs]) > k:
+                            lowest_rank = min([
+                                diff.device.index for diff in tmp_diffs
+                            ])
+                            tmp_diffs = [
+                                diff.to(lowest_rank) for diff in tmp_diffs
+                            ]
+                            tmp_diffs_topk = torch.topk(
+                                torch.cat(tmp_diffs),
+                                k,
+                                largest=True,
+                            )
+                        else:
+                            tmp_diffs_topk = torch.cat(tmp_diffs)
+                        new_diffs.append(tmp_diffs_topk.values)
+                        tmp_diffs = []
+
+                    diffs = new_diffs
+
+                diffs = [
+                    diff.to(lowest_rank) for diff in diffs
+                ]
+                diffs = torch.cat(diffs)
+                thresh = torch.topk(diffs, k, largest=True).values[-1].item()
+
+                print(f'Masking threshold = {thresh}')
+
                 n_masked = 0
                 for n, p in tqdm(
                     list(self.model.named_parameters()),
@@ -65,6 +120,10 @@ def LotteryTicketSparseFineTuner(_Trainer):
                         n_masked += to_mask.sum()
 
                 logger.info(f'Masked {n_masked} params')
+            
+            del diffs, valid_indices, valid_deltas, abs_deltas, delta, to_mask, abs_delta
+            gc.collect()
+            torch.cuda.empty_cache()
 
         def train(self, **kwargs):
             self.freeze()

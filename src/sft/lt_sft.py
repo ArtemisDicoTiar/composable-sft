@@ -11,14 +11,6 @@ from .trainer import SparseFineTuner
 logger = logging.getLogger(__name__)
 
 
-import psutil
-def mem_usage():
-    p = psutil.Process()
-    #byte를 사람이 인지하기 쉬운 megabyte로 변환
-    #megabyte이므로 1024 * 1024의 값을 나눠줌
-    print(f'mem usage : {p.memory_info().rss/2**20}MB')
-
-
 def LotteryTicketSparseFineTuner(_Trainer):
 
     _SparseFineTuner = SparseFineTuner(_Trainer)
@@ -53,13 +45,23 @@ def LotteryTicketSparseFineTuner(_Trainer):
                         valid_indices = (~self._mask[n]).view(-1)
                         valid_deltas = delta[valid_indices]
                         abs_deltas = torch.abs(valid_deltas)
-                        diffs.append(abs_deltas)
-                
+                        # Do not convert tensor to numpy or list.
+                        # The tensors are already allocated in GPU and conversion increases RAM usage.
+                        # We can take top-K most changed numbers via tensor calculation.
+                        diffs.append(abs_deltas) 
+
+                # Concatenating all the tensors to one device simultaneously requires numerous memories and operations.
+                # Instead inspired by map-reduce, continuously looping the diffs: the list (size of N) of tensors,
+                # We concatenate the tensors, size of L, into slightly larger than `k` and reduce the size of the list, `diffs`, to less than N.
+                # Continue this process until the list size, `diff` becomes 1.
                 print("reducing diffs: ", end="")
                 while sum([len(diff) for diff in diffs]) > k:
                     print(".", end="")
                     new_diffs = []
                     tmp_diffs = []
+
+                    # Concatenate L tensors to one tensor, that the single tensor has a size slightly larger than `K`.
+                    # Then the concatenated tensor will be truncated by `torch.topk` operation. 
                     for diff in diffs:
                         if sum([d.shape[0] for d in tmp_diffs]) > k:
                             lowest_rank = min([
@@ -79,6 +81,7 @@ def LotteryTicketSparseFineTuner(_Trainer):
 
                         tmp_diffs.append(diff)
 
+                    # If there is a remaining process for `tmp_diffs`, it is processed under this if block.
                     if len(tmp_diffs) > 0:
                         if sum([d.shape[0] for d in tmp_diffs]) > k:
                             lowest_rank = min([
@@ -99,6 +102,8 @@ def LotteryTicketSparseFineTuner(_Trainer):
 
                     diffs = new_diffs
 
+                # Now, diffs has a much smaller size of tensors.
+                # Still the numbers are allocated on GPU tensors, we use `torch.topk` instead of `np.partition`.
                 diffs = [
                     diff.to(lowest_rank) for diff in diffs
                 ]
